@@ -1,783 +1,624 @@
 //+------------------------------------------------------------------+
-//|                                              MT5_Server_TCP.mq5 |
-//|                        Copyright 2024, MetaQuotes Software Corp. |
-//|                                             https://www.mql5.com |
+//|                                           MT5_Server_TCP.mq5 |
+//|                                    Copyright 2025, PerplexCoder |
+//|                                                                  |
 //+------------------------------------------------------------------+
-#property copyright "Copyright 2024, MetaQuotes Software Corp."
-#property link      "https://www.mql5.com"
-#property version   "4.00"
-#property description "Expert Advisor servidor para comunicação com Python via TCP - VERSÃO SOCKET NATIVA"
+#property copyright "Copyright 2025, PerplexCoder"
+#property link      ""
+#property version   "2.00"
+#property description "MT5 TCP Server - Versão de Produção"
+#property description "Servidor TCP para comunicação com aplicações externas"
+#property description "Suporte a múltiplos clientes e comandos de trading"
 
 //--- Includes
+#include "MT5_Server_TCP_Functions.mqh"
 #include <Trade\Trade.mqh>
 #include <Trade\SymbolInfo.mqh>
 #include <Trade\PositionInfo.mqh>
 #include <Trade\OrderInfo.mqh>
-#include "include\socket-library-mt4-mt5.mqh"
 
-//--- Input parameters
-input int    ServerPort = 5557;           // Porta do servidor TCP
-input bool   EnableLogging = false;        // Habilitar logging detalhado
-input string LogFileName = "MT5_Server_TCP"; // Nome do arquivo de log
-input int    ServerTimeout = 1000;        // Timeout do servidor em ms
-input bool   EnableHeartbeat = true;      // Habilitar heartbeat
-input int    HeartbeatInterval = 30;      // Intervalo de heartbeat em segundos
-input int    MaxClients = 10;             // Número máximo de clientes simultâneos
+//--- Parâmetros de entrada
+input string ServerIP = "127.0.0.1";           // IP do servidor
+input int ServerPort = 9090;                    // Porta do servidor
+input int MaxClients = 10;                      // Máximo de clientes simultâneos
+input string TradingSymbol = "EURUSD";          // Símbolo para trading
+input bool EnableLogging = true;                // Habilitar logs detalhados
+input int UpdateInterval = 100;                 // Intervalo de atualização (ms)
+input ulong MagicNumber = 123456;               // Número mágico para ordens
+input bool AutoReconnect = true;                // Reconexão automática
+input int ReconnectDelay = 5000;                // Delay para reconexão (ms)
 
-//--- Global variables
+//--- Estruturas globais
+struct MarketData
+{
+    double bid;
+    double ask;
+    double spread;
+    double last_price;
+    long volume;
+    datetime timestamp;
+};
+
+struct ClientInfo
+{
+    int socket;
+    string ip_address;
+    datetime connect_time;
+    datetime last_activity;
+    bool is_active;
+    string last_command;
+};
+
+//--- Variáveis globais
+int server_socket = INVALID_HANDLE;
+ClientInfo clients[10];  // Array de clientes
+int active_clients = 0;
 string current_symbol;
+MarketData currentMarketData;
+bool server_running = false;
+datetime last_tick_time = 0;
+int reconnect_attempts = 0;
+const int MAX_RECONNECT_ATTEMPTS = 5;
+
+//--- Objetos de trading
 CTrade trade;
 CSymbolInfo symbol_info;
 CPositionInfo position_info;
 COrderInfo order_info;
 
-// TCP Server variables
-ServerSocket *tcp_server = NULL;
-ClientSocket *clients[10];  // Array de clientes conectados
-int client_count = 0;
-bool server_active = false;
-datetime last_heartbeat = 0;
-
-// Variáveis para dados de mercado em tempo real
-struct MarketData
-{
-    double bid;          // Preço de venda
-    double ask;          // Preço de compra
-    double spread;       // Spread em pontos
-    datetime timestamp;  // Timestamp do tick
-    ulong volume;        // Volume do tick
-    double last_price;   // Último preço negociado
-};
-
-// Cache de dados de mercado para otimização
-MarketData currentMarketData;
-MarketData lastMarketData;
-bool marketDataChanged = false;
-uint lastMarketDataUpdate = 0;
-int marketDataUpdateInterval = 1;        // ms
-
-// Buffer circular para histórico de preços (últimos 100 ticks)
-MarketData priceHistory[100];
-int priceHistoryIndex = 0;
-int priceHistoryCount = 0;
-
 //+------------------------------------------------------------------+
-//| Expert initialization function                                   |
+//| Função de inicialização do Expert Advisor                      |
 //+------------------------------------------------------------------+
 int OnInit()
 {
-    // Inicializar array de clientes
-    for(int i = 0; i < 10; i++)
-    {
-        clients[i] = NULL;
-    }
+    Print("=== MT5 TCP Server v2.00 - Iniciando ===");
     
-    // Obter símbolo atual
-    current_symbol = Symbol();
-    
-    // Configurar informações do símbolo
-    if(!symbol_info.Name(current_symbol))
+    // Configurar símbolo
+    current_symbol = TradingSymbol;
+    if(!SymbolSelect(current_symbol, true))
     {
-        LogMessage("ERRO: Não foi possível obter informações do símbolo " + current_symbol);
+        Print("ERRO: Não foi possível selecionar o símbolo: ", current_symbol);
         return INIT_FAILED;
     }
     
-    // Configurar objeto de negociação
-    trade.SetExpertMagicNumber(123456);
+    // Configurar objetos de trading
+    trade.SetExpertMagicNumber(MagicNumber);
     trade.SetDeviationInPoints(10);
     trade.SetTypeFilling(ORDER_FILLING_FOK);
     
-    // Inicializar servidor TCP
-    bool tcp_init_success = InitializeTCPServer();
-    
-    LogMessage("MT5 Server TCP iniciado no símbolo: " + current_symbol);
-    
-    if(tcp_init_success && server_active)
+    if(!symbol_info.Name(current_symbol))
     {
-        LogMessage("=== SERVIDOR TCP ATIVO NA PORTA " + IntegerToString(ServerPort) + " ===");
-    }
-    else
-    {
-        LogMessage("ERRO: Falha ao inicializar servidor TCP");
+        Print("ERRO: Falha ao inicializar informações do símbolo: ", current_symbol);
         return INIT_FAILED;
     }
+    
+    // Inicializar array de clientes
+    InitializeClients();
     
     // Inicializar dados de mercado
     UpdateMarketData();
     
-    // Configurar timer para processamento
-    EventSetMillisecondTimer(1); // Timer de 1ms para baixa latência
+    // Iniciar servidor TCP
+    if(!StartTCPServer())
+    {
+        Print("ERRO: Falha ao iniciar servidor TCP");
+        return INIT_FAILED;
+    }
+    
+    Print("Servidor TCP iniciado com sucesso em ", ServerIP, ":", ServerPort);
+    Print("Símbolo configurado: ", current_symbol);
+    Print("Magic Number: ", MagicNumber);
+    Print("Máximo de clientes: ", MaxClients);
     
     return INIT_SUCCEEDED;
 }
 
 //+------------------------------------------------------------------+
-//| Expert deinitialization function                                |
+//| Função de desinicialização                                     |
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-    LogMessage("Finalizando MT5 Server TCP...");
+    Print("=== Finalizando MT5 TCP Server ===");
     
-    // Fechar todas as conexões de clientes
-    CloseAllClients();
+    // Desconectar todos os clientes
+    DisconnectAllClients();
     
     // Fechar servidor
-    if(tcp_server != NULL)
+    StopTCPServer();
+    
+    string reason_text = "";
+    switch(reason)
     {
-        delete tcp_server;
-        tcp_server = NULL;
+        case REASON_PROGRAM: reason_text = "Expert removido do gráfico"; break;
+        case REASON_REMOVE: reason_text = "Expert deletado"; break;
+        case REASON_RECOMPILE: reason_text = "Expert recompilado"; break;
+        case REASON_CHARTCHANGE: reason_text = "Mudança de símbolo ou timeframe"; break;
+        case REASON_CHARTCLOSE: reason_text = "Gráfico fechado"; break;
+        case REASON_PARAMETERS: reason_text = "Parâmetros alterados"; break;
+        case REASON_ACCOUNT: reason_text = "Conta alterada"; break;
+        case REASON_TEMPLATE: reason_text = "Template aplicado"; break;
+        case REASON_INITFAILED: reason_text = "Falha na inicialização"; break;
+        case REASON_CLOSE: reason_text = "Terminal fechado"; break;
+        default: reason_text = "Motivo desconhecido (" + IntegerToString(reason) + ")"; break;
     }
     
-    server_active = false;
-    EventKillTimer();
-    
-    LogMessage("MT5 Server TCP finalizado");
+    Print("Motivo da finalização: ", reason_text);
+    Print("Servidor TCP finalizado.");
 }
 
 //+------------------------------------------------------------------+
-//| Expert tick function                                            |
+//| Função principal - chamada a cada tick                         |
 //+------------------------------------------------------------------+
 void OnTick()
 {
     // Atualizar dados de mercado
     UpdateMarketData();
     
-    // Enviar dados para clientes conectados se houve mudança
-    if(marketDataChanged && server_active)
+    // Verificar conexões de clientes
+    CheckClientConnections();
+    
+    // Processar comandos de clientes
+    ProcessClientCommands();
+    
+    // Verificar se servidor precisa ser reiniciado
+    if(!server_running && AutoReconnect)
     {
-        BroadcastMarketData();
-        marketDataChanged = false;
+        CheckServerReconnection();
     }
 }
 
 //+------------------------------------------------------------------+
-//| Timer function                                                  |
+//| Função de timer                                                |
 //+------------------------------------------------------------------+
 void OnTimer()
 {
-    if(!server_active) return;
-    
-    // Processar conexões TCP
-    HandleTCPConnections();
-    
-    // Processar mensagens dos clientes
-    ProcessClientMessages();
-    
-    // Verificar heartbeat
-    if(EnableHeartbeat && TimeCurrent() - last_heartbeat > HeartbeatInterval)
+    // Verificar status do servidor
+    if(!server_running)
     {
-        SendHeartbeat();
-        last_heartbeat = TimeCurrent();
+        if(EnableLogging)
+            Print("Timer: Servidor não está rodando");
+        return;
     }
+    
+    // Atualizar dados de mercado
+    UpdateMarketData();
+    
+    // Verificar timeout de clientes
+    CheckClientTimeouts();
+    
+    // Enviar heartbeat para clientes ativos
+    SendHeartbeatToClients();
 }
 
 //+------------------------------------------------------------------+
-//| Inicializar servidor TCP                                        |
+//| Inicializar servidor TCP                                       |
 //+------------------------------------------------------------------+
-bool InitializeTCPServer()
+bool StartTCPServer()
 {
-    LogMessage("=== INICIANDO SERVIDOR TCP ===");
-    LogMessage("Porta configurada: " + IntegerToString(ServerPort));
-    
-    // Criar servidor TCP
-    tcp_server = new ServerSocket((ushort)ServerPort, false); // false = aceitar conexões remotas
-    
-    if(tcp_server == NULL)
+    // Fechar servidor existente se houver
+    if(server_socket != INVALID_HANDLE)
     {
-        LogMessage("ERRO: Falha ao criar servidor TCP");
+        SocketClose(server_socket);
+        server_socket = INVALID_HANDLE;
+    }
+    
+    // Criar socket do servidor
+    server_socket = SocketCreate();
+    if(server_socket == INVALID_HANDLE)
+    {
+        Print("ERRO: Falha ao criar socket do servidor. Erro: ", GetLastError());
         return false;
     }
     
-    if(!tcp_server.Created())
+    // Configurar socket para não bloquear
+    if(!SocketSetOption(server_socket, SOCKET_OPTION_NONBLOCK, 1))
     {
-        LogMessage("ERRO: Falha ao criar socket do servidor - porta " + IntegerToString(ServerPort) + " pode estar em uso");
-        delete tcp_server;
-        tcp_server = NULL;
+        Print("ERRO: Falha ao configurar socket não-bloqueante. Erro: ", GetLastError());
+        SocketClose(server_socket);
+        server_socket = INVALID_HANDLE;
         return false;
     }
     
-    server_active = true;
-    LogMessage("Servidor TCP criado com sucesso na porta " + IntegerToString(ServerPort));
-    LogMessage("Aguardando conexões de clientes...");
+    // Bind do socket
+    if(!SocketBind(server_socket, ServerIP, ServerPort))
+    {
+        Print("ERRO: Falha no bind do socket. IP: ", ServerIP, " Porta: ", ServerPort, " Erro: ", GetLastError());
+        SocketClose(server_socket);
+        server_socket = INVALID_HANDLE;
+        return false;
+    }
+    
+    // Colocar socket em modo de escuta
+    if(!SocketListen(server_socket, MaxClients))
+    {
+        Print("ERRO: Falha ao colocar socket em modo de escuta. Erro: ", GetLastError());
+        SocketClose(server_socket);
+        server_socket = INVALID_HANDLE;
+        return false;
+    }
+    
+    server_running = true;
+    reconnect_attempts = 0;
+    
+    // Configurar timer
+    EventSetTimer(1); // Timer a cada segundo
+    
+    if(EnableLogging)
+        Print("Servidor TCP iniciado com sucesso em ", ServerIP, ":", ServerPort);
     
     return true;
 }
 
 //+------------------------------------------------------------------+
-//| Processar conexões TCP                                          |
+//| Parar servidor TCP                                             |
 //+------------------------------------------------------------------+
-void HandleTCPConnections()
+void StopTCPServer()
 {
-    if(!server_active || tcp_server == NULL) return;
+    server_running = false;
+    
+    if(server_socket != INVALID_HANDLE)
+    {
+        SocketClose(server_socket);
+        server_socket = INVALID_HANDLE;
+        if(EnableLogging)
+            Print("Servidor TCP fechado");
+    }
+    
+    EventKillTimer();
+}
+
+//+------------------------------------------------------------------+
+//| Inicializar array de clientes                                  |
+//+------------------------------------------------------------------+
+void InitializeClients()
+{
+    for(int i = 0; i < MaxClients; i++)
+    {
+        clients[i].socket = INVALID_HANDLE;
+        clients[i].ip_address = "";
+        clients[i].connect_time = 0;
+        clients[i].last_activity = 0;
+        clients[i].is_active = false;
+        clients[i].last_command = "";
+    }
+    active_clients = 0;
+}
+
+//+------------------------------------------------------------------+
+//| Verificar conexões de clientes                                 |
+//+------------------------------------------------------------------+
+void CheckClientConnections()
+{
+    if(!server_running || server_socket == INVALID_HANDLE)
+        return;
     
     // Aceitar novas conexões
-    ClientSocket *new_client = tcp_server.Accept();
-    if(new_client != NULL)
+    int client_socket = SocketAccept(server_socket, 0);
+    if(client_socket != INVALID_HANDLE)
     {
-        if(client_count < MaxClients)
+        // Encontrar slot livre para o cliente
+        int free_slot = FindFreeClientSlot();
+        if(free_slot >= 0)
         {
-            // Encontrar slot livre
-            for(int i = 0; i < MaxClients; i++)
+            clients[free_slot].socket = client_socket;
+            clients[free_slot].ip_address = "Cliente_" + IntegerToString(free_slot);
+            clients[free_slot].connect_time = TimeCurrent();
+            clients[free_slot].last_activity = TimeCurrent();
+            clients[free_slot].is_active = true;
+            clients[free_slot].last_command = "";
+            
+            active_clients++;
+            
+            // Configurar socket do cliente para não bloquear
+            SocketSetOption(client_socket, SOCKET_OPTION_NONBLOCK, 1);
+            
+            if(EnableLogging)
+                Print("Novo cliente conectado no slot ", free_slot, ". Total de clientes: ", active_clients);
+            
+            // Enviar mensagem de boas-vindas
+            string welcome_msg = CreateWelcomeMessage();
+            SendToClient(free_slot, welcome_msg);
+        }
+        else
+        {
+            // Não há slots livres, fechar conexão
+            SocketClose(client_socket);
+            if(EnableLogging)
+                Print("Conexão rejeitada - máximo de clientes atingido");
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Encontrar slot livre para cliente                              |
+//+------------------------------------------------------------------+
+int FindFreeClientSlot()
+{
+    for(int i = 0; i < MaxClients; i++)
+    {
+        if(!clients[i].is_active)
+            return i;
+    }
+    return -1;
+}
+
+//+------------------------------------------------------------------+
+//| Processar comandos de clientes                                 |
+//+------------------------------------------------------------------+
+void ProcessClientCommands()
+{
+    for(int i = 0; i < MaxClients; i++)
+    {
+        if(clients[i].is_active && clients[i].socket != INVALID_HANDLE)
+        {
+            string received_data = "";
+            int bytes_received = SocketReceive(clients[i].socket, received_data, 1024, 0);
+            
+            if(bytes_received > 0)
             {
-                if(clients[i] == NULL)
+                clients[i].last_activity = TimeCurrent();
+                clients[i].last_command = received_data;
+                
+                if(EnableLogging)
+                    Print("Cliente ", i, " enviou: ", received_data);
+                
+                // Processar comando
+                string response = ProcessCommand(received_data, i);
+                
+                // Enviar resposta
+                if(StringLen(response) > 0)
                 {
-                    clients[i] = new_client;
-                    client_count++;
-                    LogMessage("Cliente conectado [" + IntegerToString(i) + "]. Total de clientes: " + IntegerToString(client_count));
-                    
-                    // Enviar mensagem de boas-vindas
-                    string welcome = "{\"status\":\"connected\",\"server\":\"MT5_TCP_Server\",\"version\":\"4.0\",\"symbol\":\"" + current_symbol + "\"}";
-                    new_client.Send(welcome);
-                    break;
+                    SendToClient(i, response);
                 }
+            }
+            else if(bytes_received < 0)
+            {
+                int error = GetLastError();
+                if(error != 0 && error != 4014) // 4014 = WSAEWOULDBLOCK (normal para socket não-bloqueante)
+                {
+                    if(EnableLogging)
+                        Print("Erro ao receber dados do cliente ", i, ". Erro: ", error);
+                    DisconnectClient(i);
+                }
+            }
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Enviar dados para cliente específico                           |
+//+------------------------------------------------------------------+
+bool SendToClient(int client_index, string data)
+{
+    if(client_index < 0 || client_index >= MaxClients)
+        return false;
+    
+    if(!clients[client_index].is_active || clients[client_index].socket == INVALID_HANDLE)
+        return false;
+    
+    // Adicionar terminador de linha se não houver
+    if(StringFind(data, "\n") < 0)
+        data += "\n";
+    
+    int bytes_sent = SocketSend(clients[client_index].socket, data, StringLen(data), 0);
+    
+    if(bytes_sent <= 0)
+    {
+        if(EnableLogging)
+            Print("Falha ao enviar dados para cliente ", client_index, ". Erro: ", GetLastError());
+        DisconnectClient(client_index);
+        return false;
+    }
+    
+    if(EnableLogging && StringFind(data, "pong") < 0) // Não logar pongs para evitar spam
+        Print("Enviado para cliente ", client_index, ": ", StringSubstr(data, 0, MathMin(100, StringLen(data))));
+    
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| Desconectar cliente específico                                 |
+//+------------------------------------------------------------------+
+void DisconnectClient(int client_index)
+{
+    if(client_index < 0 || client_index >= MaxClients)
+        return;
+    
+    if(clients[client_index].is_active)
+    {
+        if(clients[client_index].socket != INVALID_HANDLE)
+        {
+            SocketClose(clients[client_index].socket);
+        }
+        
+        clients[client_index].socket = INVALID_HANDLE;
+        clients[client_index].ip_address = "";
+        clients[client_index].connect_time = 0;
+        clients[client_index].last_activity = 0;
+        clients[client_index].is_active = false;
+        clients[client_index].last_command = "";
+        
+        active_clients--;
+        
+        if(EnableLogging)
+            Print("Cliente ", client_index, " desconectado. Clientes ativos: ", active_clients);
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Desconectar todos os clientes                                  |
+//+------------------------------------------------------------------+
+void DisconnectAllClients()
+{
+    for(int i = 0; i < MaxClients; i++)
+    {
+        if(clients[i].is_active)
+        {
+            DisconnectClient(i);
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Verificar timeout de clientes                                  |
+//+------------------------------------------------------------------+
+void CheckClientTimeouts()
+{
+    datetime current_time = TimeCurrent();
+    const int TIMEOUT_SECONDS = 300; // 5 minutos
+    
+    for(int i = 0; i < MaxClients; i++)
+    {
+        if(clients[i].is_active)
+        {
+            if(current_time - clients[i].last_activity > TIMEOUT_SECONDS)
+            {
+                if(EnableLogging)
+                    Print("Cliente ", i, " timeout - desconectando");
+                DisconnectClient(i);
+            }
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Enviar heartbeat para clientes ativos                          |
+//+------------------------------------------------------------------+
+void SendHeartbeatToClients()
+{
+    static datetime last_heartbeat = 0;
+    datetime current_time = TimeCurrent();
+    
+    // Enviar heartbeat a cada 30 segundos
+    if(current_time - last_heartbeat >= 30)
+    {
+        string heartbeat = CreateHeartbeatMessage();
+        
+        for(int i = 0; i < MaxClients; i++)
+        {
+            if(clients[i].is_active)
+            {
+                SendToClient(i, heartbeat);
+            }
+        }
+        
+        last_heartbeat = current_time;
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Atualizar dados de mercado                                     |
+//+------------------------------------------------------------------+
+void UpdateMarketData()
+{
+    if(!symbol_info.RefreshRates())
+        return;
+    
+    currentMarketData.bid = symbol_info.Bid();
+    currentMarketData.ask = symbol_info.Ask();
+    currentMarketData.spread = symbol_info.Spread();
+    currentMarketData.last_price = symbol_info.Last();
+    currentMarketData.volume = symbol_info.Volume();
+    currentMarketData.timestamp = TimeCurrent();
+    
+    last_tick_time = TimeCurrent();
+}
+
+//+------------------------------------------------------------------+
+//| Verificar reconexão do servidor                                |
+//+------------------------------------------------------------------+
+void CheckServerReconnection()
+{
+    static datetime last_reconnect_attempt = 0;
+    datetime current_time = TimeCurrent();
+    
+    if(current_time - last_reconnect_attempt >= ReconnectDelay / 1000)
+    {
+        if(reconnect_attempts < MAX_RECONNECT_ATTEMPTS)
+        {
+            reconnect_attempts++;
+            Print("Tentativa de reconexão ", reconnect_attempts, "/", MAX_RECONNECT_ATTEMPTS);
+            
+            if(StartTCPServer())
+            {
+                Print("Reconexão bem-sucedida");
+                reconnect_attempts = 0;
+            }
+            else
+            {
+                Print("Falha na reconexão ", reconnect_attempts);
             }
         }
         else
         {
-            LogMessage("Máximo de clientes atingido. Rejeitando conexão.");
-            delete new_client;
-        }
-    }
-}
-
-//+------------------------------------------------------------------+
-//| Processar mensagens dos clientes                                |
-//+------------------------------------------------------------------+
-void ProcessClientMessages()
-{
-    for(int i = 0; i < MaxClients; i++)
-    {
-        if(clients[i] == NULL) continue;
-        
-        // Verificar se cliente ainda está conectado
-        if(!clients[i].IsSocketConnected())
-        {
-            LogMessage("Cliente [" + IntegerToString(i) + "] desconectado");
-            delete clients[i];
-            clients[i] = NULL;
-            client_count--;
-            continue;
+            Print("Máximo de tentativas de reconexão atingido. Desabilitando reconexão automática.");
+            // Não desabilitar completamente, apenas aguardar mais tempo
+            reconnect_attempts = 0;
+            last_reconnect_attempt = current_time + 60; // Tentar novamente em 1 minuto
         }
         
-        // Receber mensagens
-        string message = clients[i].Receive();
-        if(message != "")
-        {
-            LogMessage("Mensagem recebida do cliente [" + IntegerToString(i) + "]: " + message);
-            
-            // Processar comando
-            string response = ProcessCommand(message);
-            if(response != "")
-            {
-                clients[i].Send(response);
-            }
-        }
+        last_reconnect_attempt = current_time;
     }
 }
 
 //+------------------------------------------------------------------+
-//| Processar comando recebido                                      |
+//| Criar mensagem de boas-vindas                                  |
 //+------------------------------------------------------------------+
-string ProcessCommand(string command)
-{
-    // Parse do comando JSON
-    if(StringFind(command, "ping") >= 0 || StringFind(command, "PING") >= 0)
-    {
-        return "{\"action\":\"pong\",\"timestamp\":\"" + TimeToString(TimeCurrent()) + "\",\"server_time\":" + IntegerToString(TimeCurrent()) + "}";
-    }
-    else if(StringFind(command, "market_data") >= 0)
-    {
-        return GetMarketDataJSON();
-    }
-    else if(StringFind(command, "account_info") >= 0)
-    {
-        return GetAccountInfoJSON();
-    }
-    else if(StringFind(command, "positions") >= 0)
-    {
-        return GetPositionsJSON();
-    }
-    else if(StringFind(command, "orders") >= 0)
-    {
-        return GetOrdersJSON();
-    }
-    else if(StringFind(command, "place_order") >= 0)
-    {
-        return ProcessPlaceOrder(command);
-    }
-    else if(StringFind(command, "place_pending_order") >= 0)
-    {
-        return ProcessPlacePendingOrder(command);
-    }
-    else if(StringFind(command, "close_position") >= 0)
-    {
-        return ProcessClosePosition(command);
-    }
-    else if(StringFind(command, "history") >= 0)
-    {
-        return GetHistoryJSON();
-    }
-    
-    // Comando não reconhecido
-    return "{\"error\":\"Comando não reconhecido\",\"received\":\"" + command + "\"}";
-}
-
-//+------------------------------------------------------------------+
-//| Atualizar dados de mercado                                      |
-//+------------------------------------------------------------------+
-void UpdateMarketData()
-{
-    // Salvar dados anteriores
-    lastMarketData = currentMarketData;
-    
-    // Obter novos dados
-    currentMarketData.bid = SymbolInfoDouble(current_symbol, SYMBOL_BID);
-    currentMarketData.ask = SymbolInfoDouble(current_symbol, SYMBOL_ASK);
-    currentMarketData.spread = (currentMarketData.ask - currentMarketData.bid) / SymbolInfoDouble(current_symbol, SYMBOL_POINT);
-    currentMarketData.timestamp = TimeCurrent();
-    currentMarketData.volume = SymbolInfoInteger(current_symbol, SYMBOL_VOLUME);
-    currentMarketData.last_price = SymbolInfoDouble(current_symbol, SYMBOL_LAST);
-    
-    // Verificar se houve mudança
-    if(currentMarketData.bid != lastMarketData.bid || 
-       currentMarketData.ask != lastMarketData.ask ||
-       currentMarketData.volume != lastMarketData.volume)
-    {
-        marketDataChanged = true;
-        
-        // Adicionar ao histórico
-        priceHistory[priceHistoryIndex] = currentMarketData;
-        priceHistoryIndex = (priceHistoryIndex + 1) % 100;
-        if(priceHistoryCount < 100) priceHistoryCount++;
-    }
-}
-
-//+------------------------------------------------------------------+
-//| Transmitir dados de mercado para todos os clientes             |
-//+------------------------------------------------------------------+
-void BroadcastMarketData()
-{
-    string market_data = GetMarketDataJSON();
-    
-    for(int i = 0; i < MaxClients; i++)
-    {
-        if(clients[i] != NULL && clients[i].IsSocketConnected())
-        {
-            clients[i].Send(market_data);
-        }
-    }
-}
-
-//+------------------------------------------------------------------+
-//| Obter dados de mercado em formato JSON                         |
-//+------------------------------------------------------------------+
-string GetMarketDataJSON()
+string CreateWelcomeMessage()
 {
     string json = "{";
-    json += "\"action\":\"market_data\",";
-    json += "\"data\":{";
+    json += "\"action\":\"welcome\",";
+    json += "\"server\":\"MT5 TCP Server v2.00\",";
     json += "\"symbol\":\"" + current_symbol + "\",";
-    json += "\"bid\":" + DoubleToString(currentMarketData.bid, Digits()) + ",";
-    json += "\"ask\":" + DoubleToString(currentMarketData.ask, Digits()) + ",";
-    json += "\"spread\":" + DoubleToString(currentMarketData.spread, 1) + ",";
-    json += "\"last\":" + DoubleToString(currentMarketData.last_price, Digits()) + ",";
-    json += "\"volume\":" + IntegerToString(currentMarketData.volume) + ",";
-    json += "\"time\":\"" + TimeToString(currentMarketData.timestamp, TIME_DATE|TIME_SECONDS) + "\",";
-    json += "\"digits\":" + IntegerToString(Digits()) + ",";
-    json += "\"point\":" + DoubleToString(SymbolInfoDouble(current_symbol, SYMBOL_POINT), 8) + ",";
-    json += "\"tick_size\":" + DoubleToString(SymbolInfoDouble(current_symbol, SYMBOL_TRADE_TICK_SIZE), 8) + ",";
-    json += "\"min_lot\":" + DoubleToString(SymbolInfoDouble(current_symbol, SYMBOL_VOLUME_MIN), 2) + ",";
-    json += "\"max_lot\":" + DoubleToString(SymbolInfoDouble(current_symbol, SYMBOL_VOLUME_MAX), 2) + ",";
-    json += "\"lot_step\":" + DoubleToString(SymbolInfoDouble(current_symbol, SYMBOL_VOLUME_STEP), 2);
+    json += "\"server_time\":" + IntegerToString(TimeCurrent()) + ",";
+    json += "\"magic_number\":" + IntegerToString(MagicNumber) + ",";
+    json += "\"status\":\"connected\"";
+    json += "}";
+    
+    return json;
+}
+
+//+------------------------------------------------------------------+
+//| Criar mensagem de heartbeat                                    |
+//+------------------------------------------------------------------+
+string CreateHeartbeatMessage()
+{
+    string json = "{";
+    json += "\"action\":\"heartbeat\",";
+    json += "\"server_time\":" + IntegerToString(TimeCurrent()) + ",";
+    json += "\"active_clients\":" + IntegerToString(active_clients) + ",";
+    json += "\"market_open\":" + (SymbolInfoInteger(current_symbol, SYMBOL_TRADE_MODE) == SYMBOL_TRADE_MODE_FULL ? "true" : "false") + ",";
+    json += "\"status\":\"ok\"";
+    json += "}";
+    
+    return json;
+}
+
+//+------------------------------------------------------------------+
+//| Obter status do servidor                                       |
+//+------------------------------------------------------------------+
+string GetServerStatus()
+{
+    string json = "{";
+    json += "\"action\":\"server_status\",";
+    json += "\"data\":{";
+    json += "\"server_running\":" + (server_running ? "true" : "false") + ",";
+    json += "\"active_clients\":" + IntegerToString(active_clients) + ",";
+    json += "\"max_clients\":" + IntegerToString(MaxClients) + ",";
+    json += "\"current_symbol\":\"" + current_symbol + "\",";
+    json += "\"server_time\":" + IntegerToString(TimeCurrent()) + ",";
+    json += "\"last_tick\":" + IntegerToString(last_tick_time) + ",";
+    json += "\"magic_number\":" + IntegerToString(MagicNumber) + ",";
+    json += "\"auto_reconnect\":" + (AutoReconnect ? "true" : "false") + ",";
+    json += "\"reconnect_attempts\":" + IntegerToString(reconnect_attempts) + ",";
+    json += "\"market_open\":" + (SymbolInfoInteger(current_symbol, SYMBOL_TRADE_MODE) == SYMBOL_TRADE_MODE_FULL ? "true" : "false") + ",";
+    json += "\"account_balance\":" + DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2) + ",";
+    json += "\"account_equity\":" + DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2) + ",";
+    json += "\"positions_total\":" + IntegerToString(PositionsTotal()) + ",";
+    json += "\"orders_total\":" + IntegerToString(OrdersTotal());
     json += "}}";
     
     return json;
 }
 
 //+------------------------------------------------------------------+
-//| Obter informações da conta em formato JSON                     |
-//+------------------------------------------------------------------+
-string GetAccountInfoJSON()
-{
-    string json = "{";
-    json += "\"action\":\"account_info\",";
-    json += "\"data\":{";
-    json += "\"login\":" + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + ",";
-    json += "\"name\":\"" + AccountInfoString(ACCOUNT_NAME) + "\",";
-    json += "\"server\":\"" + AccountInfoString(ACCOUNT_SERVER) + "\",";
-    json += "\"currency\":\"" + AccountInfoString(ACCOUNT_CURRENCY) + "\",";
-    json += "\"balance\":" + DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2) + ",";
-    json += "\"equity\":" + DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2) + ",";
-    json += "\"profit\":" + DoubleToString(AccountInfoDouble(ACCOUNT_PROFIT), 2) + ",";
-    json += "\"margin\":" + DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN), 2) + ",";
-    json += "\"margin_free\":" + DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN_FREE), 2) + ",";
-    json += "\"margin_level\":" + DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN_LEVEL), 2) + ",";
-    json += "\"leverage\":" + IntegerToString(AccountInfoInteger(ACCOUNT_LEVERAGE)) + ",";
-    json += "\"trade_allowed\":" + (AccountInfoInteger(ACCOUNT_TRADE_ALLOWED) ? "true" : "false") + ",";
-    json += "\"trade_expert\":" + (AccountInfoInteger(ACCOUNT_TRADE_EXPERT) ? "true" : "false") + ",";
-    json += "\"margin_so_mode\":" + IntegerToString(AccountInfoInteger(ACCOUNT_MARGIN_SO_MODE)) + ",";
-    json += "\"margin_so_call\":" + DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN_SO_CALL), 2) + ",";
-    json += "\"margin_so_so\":" + DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN_SO_SO), 2) + ",";
-    json += "\"margin_initial\":" + DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN_INITIAL), 2) + ",";
-    json += "\"margin_maintenance\":" + DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN_MAINTENANCE), 2) + ",";
-    json += "\"assets\":" + DoubleToString(AccountInfoDouble(ACCOUNT_ASSETS), 2) + ",";
-    json += "\"liabilities\":" + DoubleToString(AccountInfoDouble(ACCOUNT_LIABILITIES), 2) + ",";
-    json += "\"commission_blocked\":" + DoubleToString(AccountInfoDouble(ACCOUNT_COMMISSION_BLOCKED), 2);
-    json += "}}";
-    
-    return json;
-}
-
-//+------------------------------------------------------------------+
-//| Obter histórico de transações em formato JSON                  |
-//+------------------------------------------------------------------+
-string GetHistoryJSON(datetime from_date = 0, datetime to_date = 0)
-{
-    if(from_date == 0) from_date = TimeCurrent() - 86400 * 30; // Últimos 30 dias
-    if(to_date == 0) to_date = TimeCurrent();
-    
-    if(!HistorySelect(from_date, to_date))
-    {
-        return "{\"action\":\"history\",\"error\":\"Failed to select history\"}";
-    }
-    
-    string json = "{";
-    json += "\"action\":\"history\",";
-    json += "\"data\":{";
-    json += "\"from\":\"" + TimeToString(from_date, TIME_DATE|TIME_SECONDS) + "\",";
-    json += "\"to\":\"" + TimeToString(to_date, TIME_DATE|TIME_SECONDS) + "\",";
-    json += "\"deals\":[";
-    
-    int total_deals = HistoryDealsTotal();
-    for(int i = 0; i < total_deals && i < 100; i++) // Limitar a 100 deals
-    {
-        ulong deal_ticket = HistoryDealGetTicket(i);
-        if(deal_ticket > 0)
-        {
-            if(i > 0) json += ",";
-            json += "{";
-            json += "\"ticket\":" + IntegerToString(deal_ticket) + ",";
-            json += "\"order\":" + IntegerToString(HistoryDealGetInteger(deal_ticket, DEAL_ORDER)) + ",";
-            json += "\"time\":\"" + TimeToString((datetime)HistoryDealGetInteger(deal_ticket, DEAL_TIME), TIME_DATE|TIME_SECONDS) + "\",";
-            json += "\"type\":" + IntegerToString(HistoryDealGetInteger(deal_ticket, DEAL_TYPE)) + ",";
-            json += "\"entry\":" + IntegerToString(HistoryDealGetInteger(deal_ticket, DEAL_ENTRY)) + ",";
-            json += "\"symbol\":\"" + HistoryDealGetString(deal_ticket, DEAL_SYMBOL) + "\",";
-            json += "\"volume\":" + DoubleToString(HistoryDealGetDouble(deal_ticket, DEAL_VOLUME), 2) + ",";
-            json += "\"price\":" + DoubleToString(HistoryDealGetDouble(deal_ticket, DEAL_PRICE), Digits()) + ",";
-            json += "\"commission\":" + DoubleToString(HistoryDealGetDouble(deal_ticket, DEAL_COMMISSION), 2) + ",";
-            json += "\"swap\":" + DoubleToString(HistoryDealGetDouble(deal_ticket, DEAL_SWAP), 2) + ",";
-            json += "\"profit\":" + DoubleToString(HistoryDealGetDouble(deal_ticket, DEAL_PROFIT), 2) + ",";
-            json += "\"comment\":\"" + HistoryDealGetString(deal_ticket, DEAL_COMMENT) + "\"";
-            json += "}";
-        }
-    }
-    
-    json += "],";
-    json += "\"orders\":[";
-    
-    int total_orders = HistoryOrdersTotal();
-    for(int i = 0; i < total_orders && i < 100; i++) // Limitar a 100 orders
-    {
-        ulong order_ticket = HistoryOrderGetTicket(i);
-        if(order_ticket > 0)
-        {
-            if(i > 0) json += ",";
-            json += "{";
-            json += "\"ticket\":" + IntegerToString(order_ticket) + ",";
-            json += "\"time_setup\":\"" + TimeToString((datetime)HistoryOrderGetInteger(order_ticket, ORDER_TIME_SETUP), TIME_DATE|TIME_SECONDS) + "\",";
-            json += "\"time_done\":\"" + TimeToString((datetime)HistoryOrderGetInteger(order_ticket, ORDER_TIME_DONE), TIME_DATE|TIME_SECONDS) + "\",";
-            json += "\"type\":" + IntegerToString(HistoryOrderGetInteger(order_ticket, ORDER_TYPE)) + ",";
-            json += "\"state\":" + IntegerToString(HistoryOrderGetInteger(order_ticket, ORDER_STATE)) + ",";
-            json += "\"symbol\":\"" + HistoryOrderGetString(order_ticket, ORDER_SYMBOL) + "\",";
-            json += "\"volume_initial\":" + DoubleToString(HistoryOrderGetDouble(order_ticket, ORDER_VOLUME_INITIAL), 2) + ",";
-            json += "\"volume_current\":" + DoubleToString(HistoryOrderGetDouble(order_ticket, ORDER_VOLUME_CURRENT), 2) + ",";
-            json += "\"price_open\":" + DoubleToString(HistoryOrderGetDouble(order_ticket, ORDER_PRICE_OPEN), Digits()) + ",";
-            json += "\"sl\":" + DoubleToString(HistoryOrderGetDouble(order_ticket, ORDER_SL), Digits()) + ",";
-            json += "\"tp\":" + DoubleToString(HistoryOrderGetDouble(order_ticket, ORDER_TP), Digits()) + ",";
-            json += "\"comment\":\"" + HistoryOrderGetString(order_ticket, ORDER_COMMENT) + "\"";
-            json += "}";
-        }
-    }
-    
-    json += "]}}";
-    return json;
-}
-
-//+------------------------------------------------------------------+
-//| Obter posições em formato JSON                                 |
-//+------------------------------------------------------------------+
-string GetPositionsJSON()
-{
-    string json = "{\"action\":\"positions\",\"data\":[";
-    
-    bool first = true;
-    for(int i = 0; i < PositionsTotal(); i++)
-    {
-        if(position_info.SelectByIndex(i))
-        {
-            if(!first) json += ",";
-            
-            json += "{";
-            json += "\"ticket\":" + IntegerToString(position_info.Ticket()) + ",";
-            json += "\"symbol\":\"" + position_info.Symbol() + "\",";
-            json += "\"type\":" + IntegerToString(position_info.PositionType()) + ",";
-            json += "\"volume\":" + DoubleToString(position_info.Volume(), 2) + ",";
-            json += "\"price_open\":" + DoubleToString(position_info.PriceOpen(), Digits()) + ",";
-            json += "\"price_current\":" + DoubleToString(position_info.PriceCurrent(), Digits()) + ",";
-            json += "\"profit\":" + DoubleToString(position_info.Profit(), 2) + ",";
-            json += "\"swap\":" + DoubleToString(position_info.Swap(), 2) + ",";
-            json += "\"comment\":\"" + position_info.Comment() + "\"";
-            json += "}";
-            
-            first = false;
-        }
-    }
-    
-    json += "]}";
-    return json;
-}
-
-//+------------------------------------------------------------------+
-//| Obter ordens em formato JSON                                   |
-//+------------------------------------------------------------------+
-string GetOrdersJSON()
-{
-    string json = "{\"action\":\"orders\",\"data\":[";
-    
-    bool first = true;
-    for(int i = 0; i < OrdersTotal(); i++)
-    {
-        if(order_info.SelectByIndex(i))
-        {
-            if(!first) json += ",";
-            
-            json += "{";
-            json += "\"ticket\":" + IntegerToString(order_info.Ticket()) + ",";
-            json += "\"symbol\":\"" + order_info.Symbol() + "\",";
-            json += "\"type\":" + IntegerToString(order_info.OrderType()) + ",";
-            json += "\"volume\":" + DoubleToString(order_info.VolumeInitial(), 2) + ",";
-            json += "\"price_open\":" + DoubleToString(order_info.PriceOpen(), Digits()) + ",";
-            json += "\"price_current\":" + DoubleToString(order_info.PriceCurrent(), Digits()) + ",";
-            json += "\"comment\":\"" + order_info.Comment() + "\"";
-            json += "}";
-            
-            first = false;
-        }
-    }
-    
-    json += "]}";
-    return json;
-}
-
-//+------------------------------------------------------------------+
-//| Enviar heartbeat para todos os clientes                        |
-//+------------------------------------------------------------------+
-void SendHeartbeat()
-{
-    string heartbeat = "{\"action\":\"heartbeat\",\"timestamp\":" + IntegerToString(TimeCurrent()) + ",\"clients\":" + IntegerToString(client_count) + "}";
-    
-    for(int i = 0; i < MaxClients; i++)
-    {
-        if(clients[i] != NULL && clients[i].IsSocketConnected())
-        {
-            clients[i].Send(heartbeat);
-        }
-    }
-}
-
-//+------------------------------------------------------------------+
-//| Fechar todas as conexões de clientes                           |
-//+------------------------------------------------------------------+
-void CloseAllClients()
-{
-    for(int i = 0; i < MaxClients; i++)
-    {
-        if(clients[i] != NULL)
-        {
-            delete clients[i];
-            clients[i] = NULL;
-        }
-    }
-    client_count = 0;
-}
-
-//+------------------------------------------------------------------+
-//| Processar ordem a mercado                                       |
-//+------------------------------------------------------------------+
-string ProcessPlaceOrder(string command)
-{
-    // Extrair parâmetros do comando JSON (implementação simplificada)
-    string symbol = "EURUSD"; // Default
-    double volume = 0.01;
-    ENUM_ORDER_TYPE order_type = ORDER_TYPE_BUY;
-    string comment = "MT5 TCP Order";
-    
-    // Parse básico do JSON (pode ser melhorado)
-    if(StringFind(command, "sell") >= 0) order_type = ORDER_TYPE_SELL;
-    if(StringFind(command, "GBPUSD") >= 0) symbol = "GBPUSD";
-    if(StringFind(command, "USDJPY") >= 0) symbol = "USDJPY";
-    if(StringFind(command, "XAUUSD") >= 0) symbol = "XAUUSD";
-    
-    // Executar ordem
-    trade.SetExpertMagicNumber(123456);
-    trade.SetDeviationInPoints(10);
-    
-    bool result = false;
-    if(order_type == ORDER_TYPE_BUY)
-    {
-        result = trade.Buy(volume, symbol, 0, 0, 0, comment);
-    }
-    else
-    {
-        result = trade.Sell(volume, symbol, 0, 0, 0, comment);
-    }
-    
-    string json = "{";
-    json += "\"action\":\"place_order\",";
-    json += "\"success\":" + (result ? "true" : "false") + ",";
-    
-    if(result)
-    {
-        json += "\"ticket\":" + IntegerToString(trade.ResultOrder()) + ",";
-        json += "\"price\":" + DoubleToString(trade.ResultPrice(), Digits()) + ",";
-        json += "\"volume\":" + DoubleToString(volume, 2) + ",";
-        json += "\"symbol\":\"" + symbol + "\"";
-    }
-    else
-    {
-        json += "\"error\":\"" + trade.ResultComment() + "\",";
-        json += "\"error_code\":" + IntegerToString(trade.ResultRetcode());
-    }
-    
-    json += "}";
-    return json;
-}
-
-//+------------------------------------------------------------------+
-//| Processar ordem pendente                                        |
-//+------------------------------------------------------------------+
-string ProcessPlacePendingOrder(string command)
-{
-    string symbol = "EURUSD";
-    double volume = 0.01;
-    ENUM_ORDER_TYPE order_type = ORDER_TYPE_BUY_LIMIT;
-    double price = 0;
-    string comment = "MT5 TCP Pending Order";
-    
-    // Parse básico do JSON
-    if(StringFind(command, "sell_limit") >= 0) order_type = ORDER_TYPE_SELL_LIMIT;
-    if(StringFind(command, "buy_stop") >= 0) order_type = ORDER_TYPE_BUY_STOP;
-    if(StringFind(command, "sell_stop") >= 0) order_type = ORDER_TYPE_SELL_STOP;
-    
-    // Definir preço baseado no tipo de ordem
-    double current_price = SymbolInfoDouble(symbol, SYMBOL_ASK);
-    if(order_type == ORDER_TYPE_BUY_LIMIT)
-        price = current_price - 50 * SymbolInfoDouble(symbol, SYMBOL_POINT);
-    else if(order_type == ORDER_TYPE_SELL_LIMIT)
-        price = current_price + 50 * SymbolInfoDouble(symbol, SYMBOL_POINT);
-    else if(order_type == ORDER_TYPE_BUY_STOP)
-        price = current_price + 50 * SymbolInfoDouble(symbol, SYMBOL_POINT);
-    else if(order_type == ORDER_TYPE_SELL_STOP)
-        price = current_price - 50 * SymbolInfoDouble(symbol, SYMBOL_POINT);
-    
-    trade.SetExpertMagicNumber(123456);
-    bool result = trade.OrderOpen(symbol, order_type, volume, 0, price, 0, 0, ORDER_TIME_GTC, 0, comment);
-    
-    string json = "{";
-    json += "\"action\":\"place_pending_order\",";
-    json += "\"success\":" + (result ? "true" : "false") + ",";
-    
-    if(result)
-    {
-        json += "\"ticket\":" + IntegerToString(trade.ResultOrder()) + ",";
-        json += "\"price\":" + DoubleToString(price, Digits()) + ",";
-        json += "\"volume\":" + DoubleToString(volume, 2) + ",";
-        json += "\"symbol\":\"" + symbol + "\",";
-        json += "\"type\":" + IntegerToString(order_type);
-    }
-    else
-    {
-        json += "\"error\":\"" + trade.ResultComment() + "\",";
-        json += "\"error_code\":" + IntegerToString(trade.ResultRetcode());
-    }
-    
-    json += "}";
-    return json;
-}
-
-//+------------------------------------------------------------------+
-//| Processar fechamento de posição                                 |
-//+------------------------------------------------------------------+
-string ProcessClosePosition(string command)
-{
-    // Extrair ticket da posição (implementação simplificada)
-    ulong ticket = 0;
-    
-    // Parse básico para extrair ticket
-    int start = StringFind(command, "ticket");
-    if(start >= 0)
-    {
-        start = StringFind(command, ":", start) + 1;
-        int end = StringFind(command, ",", start);
-        if(end < 0) end = StringFind(command, "}", start);
-        if(end > start)
-        {
-            string ticket_str = StringSubstr(command, start, end - start);
-            StringTrimLeft(ticket_str);
-            StringTrimRight(ticket_str);
-            ticket = StringToInteger(ticket_str);
-        }
-    }
-    
-    bool result = false;
-    double profit = 0;
-    
-    if(ticket > 0 && position_info.SelectByTicket(ticket))
-    {
-        profit = position_info.Profit();
-        result = trade.PositionClose(ticket);
-    }
-    
-    string json = "{";
-    json += "\"action\":\"close_position\",";
-    json += "\"success\":" + (result ? "true" : "false") + ",";
-    json += "\"ticket\":" + IntegerToString(ticket) + ",";
-    
-    if(result)
-    {
-        json += "\"profit\":" + DoubleToString(profit, 2);
-    }
-    else
-    {
-        json += "\"error\":\"" + (ticket == 0 ? "Ticket inválido" : trade.ResultComment()) + "\",";
-        json += "\"error_code\":" + IntegerToString(trade.ResultRetcode());
-    }
-    
-    json += "}";
-    return json;
-}
-
-//+------------------------------------------------------------------+
-//| Função de logging                                               |
-//+------------------------------------------------------------------+
-void LogMessage(string message)
-{
-    if(EnableLogging)
-    {
-        string timestamp = TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS);
-        string log_msg = "[" + timestamp + "] " + message;
-        Print(log_msg);
-        
-        // Salvar em arquivo se especificado
-        if(LogFileName != "")
-        {
-            int file_handle = FileOpen(LogFileName + ".log", FILE_WRITE|FILE_TXT|FILE_ANSI, "\t");
-            if(file_handle != INVALID_HANDLE)
-            {
-                FileSeek(file_handle, 0, SEEK_END);
-                FileWriteString(file_handle, log_msg + "\r\n");
-                FileClose(file_handle);
-            }
-        }
-    }
-}

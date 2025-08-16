@@ -1,36 +1,50 @@
-# Arquivos compilados do MetaTrader
+# ============================================================================
+# .gitignore - MT5 TCP Server Production
+# Versão: 2.00
+# Autor: PerplexCoder
+# Copyright: 2025, PerplexCoder
+# Data: Janeiro 2025
+# ============================================================================
+
+# Arquivos compilados do MetaTrader 5
 *.ex5
 *.ex4
+*.dll
+*.so
+*.dylib
 
-# Arquivos de log
+# Logs do MetaTrader 5
 *.log
+Logs/
+logs/
+MQL5/Logs/
 
-# Arquivos temporários
+# Arquivos temporários do MetaEditor
 *.tmp
 *.temp
-
-# Arquivos de backup
 *.bak
 *.backup
+*~
 
-# Configurações locais específicas
-# config.ini
+# Arquivos de configuração local
+config_local.ini
+local_settings.ini
+*.local
 
-# Diretórios do sistema
-.DS_Store
-Thumbs.db
-
-# Arquivos do IDE
-.vscode/
-.idea/
-*.swp
-*.swo
+# Credenciais e chaves
+*.key
+*.pem
+*.p12
+*.pfx
+passwords.txt
+credentials.txt
+api_keys.txt
 
 # Arquivos Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
+*.so
 .Python
 build/
 develop-eggs/
@@ -44,13 +58,211 @@ parts/
 sdist/
 var/
 wheels/
+share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+PIPFILE.lock
 
 # Ambientes virtuais Python
-venv/
+.env
+.venv
 env/
+venv/
 ENV/
-.venv/
-.env/
+env.bak/
+venv.bak/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pyenv
+.python-version
+
+# pipenv
+Pipfile.lock
+
+# poetry
+poetry.lock
+
+# Arquivos do sistema Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.cab
+*.msi
+*.msix
+*.msm
+*.msp
+*.lnk
+
+# Arquivos do sistema macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+
+# Arquivos do sistema Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+# IDEs e Editores
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.metadata
+.buildpath
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# Arquivos de backup
+backup/
+backups/
+*.backup
+*.bak
+*.old
+*.orig
+
+# Dados de teste e temporários
+test_data/
+temp/
+tmp/
+*.test
+*.testing
+
+# Arquivos de cache
+cache/
+.cache/
+*.cache
+
+# Arquivos de database local
+*.db
+*.sqlite
+*.sqlite3
+*.db3
+
+# Arquivos de configuração de desenvolvimento
+.env.local
+.env.development
+.env.test
+.env.production
+
+# Arquivos de monitoramento e profiling
+*.prof
+*.profile
+*.trace
+
+# Arquivos de documentação gerados
+docs/_build/
+docs/build/
+site/
+
+# Arquivos de cobertura de testes
+.coverage
+.pytest_cache/
+cov.xml
+*.cover
+*.py,cover
+.hypothesis/
+
+# Arquivos específicos do projeto
+mt5_server.pid
+client_connections.log
+trading_history.csv
+market_data_cache/
+
+# Arquivos de configuração de servidor
+server.conf
+production.ini
+
+# Certificados SSL/TLS
+*.crt
+*.cert
+*.ca-bundle
+
+# Arquivos de instalação
+installer/
+setup_files/
+*.msi
+*.exe
+*.deb
+*.rpm
+
+# Arquivos de versionamento local
+.git/
+.svn/
+.hg/
+.bzr/
+
+# Arquivos de compressão
+*.zip
+*.tar.gz
+*.rar
+*.7z
+
+# Arquivos de mídia (se não necessários)
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.tiff
+*.ico
+*.mp3
+*.mp4
+*.avi
+*.mov
+*.wmv
+
+# Arquivos de configuração específicos do usuário
+user_settings.ini
+personal_config.txt
+my_*.ini
+
+# Arquivos de lock
+*.lock
+.lock
+
+# Arquivos de processo
+*.pid
+*.seed
+*.pid.lock
+
+# Diretórios de node_modules (se houver componentes web)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Arquivos de runtime
+runtime/
+*.runtime
+
+# Arquivos de sessão
+sessions/
+*.session
+
+# ============================================================================
+# Fim do .gitignore
+# ============================================================================
