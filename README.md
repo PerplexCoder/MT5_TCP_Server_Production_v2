@@ -4,6 +4,8 @@
 
 O MT5 TCP Server Production System é uma solução completa para comunicação TCP entre MetaTrader 5 e aplicações externas. Este sistema permite controle remoto de operações de trading, consulta de dados de mercado e gerenciamento de posições através de uma interface TCP robusta e segura.
 
+The MT5 TCP Server Production System is a complete solution for TCP communication between MetaTrader 5 and external applications. This system enables remote control of trading operations, market data queries, and position management through a robust and secure TCP interface.
+
 ## Estrutura do Projeto
 
 ### Arquivos Principais
