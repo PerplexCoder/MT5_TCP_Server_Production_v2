@@ -230,5 +230,4 @@ struct ResponseData {
 
 **Versão**: 2.0  
 **Data**: 2025  
-**Licença**: Proprietária  
 **Autor**: PerplexCoder
